@@ -82,6 +82,14 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 class PI0Pytorch(nn.Module):
+    """
+    PI0 (Physical Intelligence One) PyTorch 版本的核心模型实现。
+    
+    该模型融合了 PaliGemma（视觉-语言模型）和一个用于动作生成的专家模型（Gemma-based Action Expert）。
+    其输入为多模态观察数据（图像序列、文本提示、机器人状态），输出为机器人连续控制动作序列。
+    在训练时，它使用一种流匹配（Flow Matching）或者类似扩散（Diffusion）的过程：
+    给定从纯噪声 $x_{1}$ 到真实动作 $x_{0}$ 的插值 $x_t$，模型学习预测向量场（Vector Field）$u_t = noise - actions$。
+    """
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -159,7 +167,12 @@ class PI0Pytorch(nn.Module):
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
 
     def _preprocess_observation(self, observation, *, train=True):
-        """Helper method to preprocess observation."""
+        """
+        Helper method to preprocess observation.
+        从原始多模态观测数据（通常包含由多个摄像头视角组成的图像字典、文本指令、机器人自身关节状态）中提取所需特征：
+        返回的 images: 一个列表，包含了来自多个摄像头/视角的图像张量（经过归一化和 Patch 处理）。
+        返回的 img_masks: 一个对应的布尔掩码列表，标识哪些部分是真实的图像信息，哪些是批量处理中无用的 Padding（填充补齐）部分。
+        """
         observation = _preprocessing.preprocess_observation_pytorch(observation, train=train)
         return (
             list(observation.images.values()),
@@ -179,6 +192,12 @@ class PI0Pytorch(nn.Module):
         )
 
     def sample_time(self, bsize, device):
+        """
+        在 Flow Matching / Diffusion 训练过程中随机采样时间步 $t$。
+        这里使用 Beta 分布 Beta(1.5, 1.0) 进行时间步的采样，而不是均匀分布。
+        使得采样的时间步更偏向于 t=1 附近（也就是加噪更多的区域）。
+        将其缩放压缩到 [0.001, 1.0] 的区间内，防止在极度接近 t=0 发生数值计算不稳定。
+        """
         time_beta = sample_beta(1.5, 1.0, bsize, device)
         time = time_beta * 0.999 + 0.001
         return time.to(dtype=torch.float32, device=device)
@@ -314,7 +333,13 @@ class PI0Pytorch(nn.Module):
         return embs, pad_masks, att_masks, adarms_cond
 
     def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        """
+        执行一个完整的训练前向传播，并计算流匹配（Flow Matching）的损失（batch_size x num_steps x num_motors）。
+        模型学习预测由于添加噪声带来的变动向量 $u_t$。
+        """
+        # 1. 预处理观测数据，将原始输入转换为模型可以直接使用的格式（图像张量、文本 token 等）
+        # images: 从多个摄像头视角提取出来的图像张量列表（如 主视角、手腕视角 等），在实际使用时它们会被 SigLIP 等视觉编码器提取成一组一组的 Tokens。
+        # img_masks: 用于在后续 Transformer 注意力计算时，告诉模型直接忽略掉（屏蔽）由于对齐批量数据而 Padding 进来的那些无效图像 Token。
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
 
         if noise is None:
@@ -323,11 +348,16 @@ class PI0Pytorch(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
+        # 2. 流匹配核心：构造含噪状态 x_t 和目标变动向量 u_t
         time_expanded = time[:, None, None]
+        # x_t 介于完全噪声（time=1）和真实动作（time=0）之间，它是连续插位结果
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        # u_t 表示向量场的朝向，我们要让模型预测这个真实向量场
         u_t = noise - actions
 
+        # 3. 将观察作为“前缀（Prefix）”部分嵌入，得到视觉和文本的语义表示
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        # 4. 将机器人当前状态和带噪动作作为“后缀（Suffix）”部分嵌入，附加时间步向量进行调制
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -336,6 +366,7 @@ class PI0Pytorch(nn.Module):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
+        # 5. 拼接前缀（视觉语言）与后缀（控制状态）的所有 masks 与位置 IDs，生成联合因果掩码（Causal Mask）
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
@@ -347,6 +378,7 @@ class PI0Pytorch(nn.Module):
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
+            # 将嵌入张量送到 Transformer (PaliGemma 加 Action Expert) 中进行因果理解与动作预测
             (_, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
@@ -361,6 +393,7 @@ class PI0Pytorch(nn.Module):
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
+        # 取出时间步中最终包含具体动作意图的 token 隐藏层表示
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
@@ -368,18 +401,24 @@ class PI0Pytorch(nn.Module):
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
 
+        # 预测变动向量 v_t
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
+        # 6. 利用均方误差损失（MSE Loss）比对网络预测 v_t 与真实向量 u_t 的差距
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        """
+        推理前向预测函数，经过多轮降噪（ODE Solver 或 Euler 积分等方式），输出机器人连续策略动作序列 (batch_size x num_steps x num_motors)。
+        采用了预填装 Key-Value Cache 加速机制执行图像与语言表征。
+        """
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
+        # 同样抽取图像张量列表与有效性掩码，文本 tokens 及其掩码以及机器人自身状态。推理时 train 处理开启状态为 False
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
@@ -401,10 +440,13 @@ class PI0Pytorch(nn.Module):
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
+        # 初始动作就是随机噪声 (time = 1.0)
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        # 不断降噪直至 time=0 附近
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
+            # 预测时间步 time 下的场速度 v_t
             v_t = self.denoise_step(
                 state,
                 prefix_pad_masks,
@@ -414,6 +456,7 @@ class PI0Pytorch(nn.Module):
             )
 
             # Euler step - use new tensor assignment instead of in-place operation
+            # 利用前向 Euler 方法进行一次步长积分更新： $x_{t - dt} = x_{t} + dt * v_t$ 
             x_t = x_t + dt * v_t
             time += dt
         return x_t
