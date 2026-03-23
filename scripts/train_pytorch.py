@@ -48,6 +48,7 @@ import openpi.training.data_loader as _data
 
 
 def init_logging():
+    # 统一脚本日志格式，压缩 level 名称，方便在多进程训练时快速扫日志。
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
 
     class CustomFormatter(logging.Formatter):
@@ -92,6 +93,8 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 
 
 def setup_ddp():
+    # torchrun 会通过环境变量注入 WORLD_SIZE / RANK / LOCAL_RANK；
+    # 单卡运行时这些变量通常不存在，此时退化为普通单进程训练。
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
@@ -103,6 +106,7 @@ def setup_ddp():
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    # DDP 下每个进程只绑定一张卡；非 CUDA 环境则退回 CPU。
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
@@ -124,6 +128,7 @@ def set_seed(seed: int, local_rank: int):
 
 def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
+    # 数据集配置仍复用训练模块里的统一入口，只是 framework 切到 pytorch。
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
 
@@ -153,7 +158,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
 
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
-        # Create temporary directory for atomic checkpoint saving
+        # 先写入临时目录，再原子替换正式目录，避免中途崩溃留下半成品 checkpoint。
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
@@ -162,7 +167,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             shutil.rmtree(tmp_ckpt_dir)
         tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save model state using safetensors (handle shared tensors)
+        # 模型参数用 safetensors 保存，更安全，也更适合大模型权重落盘。
         model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
@@ -177,7 +182,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         }
         torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
-        # save norm stats
+        # 归一化统计量和模型权重一起存档，这样恢复训练或单独推理时能保持一致预处理。
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
@@ -205,6 +210,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     if not checkpoint_steps:
         raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
 
+    # 目录名直接用 step 编号，因此恢复时默认取最大的 step。
     latest_step = max(checkpoint_steps)
     ckpt_dir = checkpoint_dir / f"{latest_step}"
 
@@ -215,7 +221,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         log_memory_usage(device, latest_step, "before_loading_checkpoint")
 
     try:
-        # Load model state with error handling
+        # 先加载模型，再加载优化器和训练元信息，恢复顺序与保存顺序一致。
         logging.info("Loading model state...")
         safetensors_path = ckpt_dir / "model.safetensors"
 
@@ -346,7 +352,7 @@ def train_loop(config: _config.TrainConfig):
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    # Build data loader using the unified data loader
+    # Data loader 仍然接收全局 batch_size；分布式切分由 loader / sampler 内部处理。
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
@@ -363,12 +369,12 @@ def train_loop(config: _config.TrainConfig):
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
+        # 这里单独取一个 batch 仅用于可视化输入相机视角，不参与训练。
         observation, actions = sample_batch
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
-        # Create sample images for wandb
+        # 将多路相机图像横向拼接，便于在 wandb 里一次性检查输入是否正常。
         images_to_log = []
         # Get batch size from the first image tensor
         batch_size = next(iter(sample_batch["image"].values())).shape[0]
@@ -389,7 +395,8 @@ def train_loop(config: _config.TrainConfig):
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
 
-    # Build model
+    # 构建 PyTorch 版 PI0/PI05 模型；如果 config.model 还不是 Pi0Config，
+    # 就把训练配置里的关键字段整理成模型真正需要的配置对象。
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
@@ -448,7 +455,7 @@ def train_loop(config: _config.TrainConfig):
         )
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
-    # Optimizer + learning rate schedule from config
+    # 学习率调度在训练循环里手动更新，行为尽量对齐原 JAX 训练脚本。
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
@@ -516,16 +523,17 @@ def train_loop(config: _config.TrainConfig):
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
+            # loader 输出一个 observation 树结构和动作张量；
+            # observation 内部可能包含多模态字段，因此用 tree.map 统一搬到目标设备。
             observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
-            # Update LR
+            # 每一步都显式刷新 optimizer 里的 lr，而不是依赖独立 scheduler 对象。
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
+            # 模型返回的可能是单个 loss，也可能是多个 loss 分量；这里统一规整成 tensor。
             losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
@@ -533,6 +541,7 @@ def train_loop(config: _config.TrainConfig):
             elif not isinstance(losses, torch.Tensor):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
+            # 训练优化目标是所有 loss 分量的均值。
             loss = losses.mean()
 
             # Backward pass
@@ -542,14 +551,14 @@ def train_loop(config: _config.TrainConfig):
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            # Gradient clipping
+            # 梯度裁剪用于控制大模型训练时的梯度爆炸风险。
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
 
-            # Optimizer step
+            # 标准的“反传 -> 裁剪 -> 更新 -> 清梯度”训练步。
             optim.step()
             optim.zero_grad(set_to_none=True)
 
-            # Clear gradients more aggressively
+            # 再做一次显式梯度清理，尽量降低长时间训练时的显存占用。
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad.detach_()
@@ -568,7 +577,7 @@ def train_loop(config: _config.TrainConfig):
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
 
-                # Average stats over log interval
+                # 日志按区间聚合，避免每一步都打太多信息。
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
 
@@ -601,7 +610,7 @@ def train_loop(config: _config.TrainConfig):
                 infos = []  # Reset stats collection
 
             global_step += 1
-            # Save checkpoint using the new mechanism
+            # checkpoint 在 step 递增后保存，因此目录名对应“已经完成的训练步数”。
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
 
             # Update progress bar
