@@ -10,6 +10,16 @@ from transformers.models.gemma import modeling_gemma
 
 
 class PaliGemmaWithExpertModel(nn.Module):
+    """
+    带有一个专门用于动作生成的“专家（Expert）”配置定制版 PaliGemma 模型。
+    该类将一个通用视觉语言模型（PaliGemma，被当做 Prefix 模型）与其同构的一个动作生成模型（Gemma 为基础作为 Expert/Suffix 模型）结合起来。
+
+    核心设计思想是把任务划分为：
+    1. Prefix（前缀）：视觉和语言指令的感知与理解，由 PaliGemma 负责。
+    2. Suffix（后缀）：基于 Prefix 提供的情境并结合自身机器人状态和含噪动作，解码并预测去噪动作，由 Gemma Expert 负责。
+    在训练时，两者在相同的 Transformer 注意力层中计算，这允许前缀视觉语言表征直接与后缀动作表征通过 Attention 共享知识。
+    同时，该实现大量运用了梯度检查点（Gradient Checkpointing）来极大优化显存开销。
+    """
     def __init__(
         self,
         vlm_config,
@@ -40,6 +50,11 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.torch_dtype = "float32"
 
+        # 为了给动作生成创建对应的专家模型，实例化一个基础版的 Gemma 配置。
+        # action_expert 负责处理后缀（包含动作特征），它利用从 prefix 传过来的特征进行 Flow Matching / Action 的预测。
+        # 注意：**该文件中并没有显式的 Flow Matching 计算（如加噪、计算 u_t 向量、MSE 损失）**。
+        # Flow Matching 的全量逻辑实际上在 `pi0_pytorch.py` 里的 `PI0Pytorch` 类的 `forward` 和 `sample_actions` 函数中完成。
+        # 这个模型（PaliGemmaWithExpertModel）只是被 Flow Matching 使用的 “去噪核心 Backbone 骨干网络”。
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
             head_dim=action_expert_config.head_dim,
             hidden_size=action_expert_config.width,
@@ -100,6 +115,8 @@ class PaliGemmaWithExpertModel(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
+            # 模式 1: 仅计算前缀 (Prefix) 部分（通常用于推理阶段预计算 Key-Value Caches）。
+            # 输入仅为视觉和语言 prompt 表征。
             prefix_output = self.paligemma.language_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
@@ -112,6 +129,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
+            # 模式 2: 仅计算后缀 (Suffix) 部分（常用于推理阶段多步 ODE/Euler 积分降噪）。
+            # 在之前已经计算出了前缀的 past_key_values 的情况下，此时输入含噪的动作 $x_t$，让专家模型输出去噪特征。
             suffix_output = self.gemma_expert.model.forward(
                 inputs_embeds=inputs_embeds[1],
                 attention_mask=attention_mask,
@@ -124,6 +143,8 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = None
             prefix_past_key_values = None
         else:
+            # 模式 3: 前后台联合计算（Full Forward），常用于训练阶段。
+            # 将 Prefix (PaliGemma理解的内容) 与 Suffix (Gemma 专家处理的控制信号) 同步联合送入网络深层交互。
             models = [self.paligemma.language_model, self.gemma_expert.model]
             num_layers = self.paligemma.config.text_config.num_hidden_layers
 
@@ -164,6 +185,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                 gates = []
                 for i, hidden_states in enumerate(inputs_embeds):
                     layer = models[i].layers[layer_idx]
+                    # 这里的 cond=adarms_cond[i] 就是用自适应 RMSNorm (AdaRMS) 对各个模块单独执行的一种基于外部条件 (如 timestep 步长信息) 的特征调制（Modulation / FiLM）。
+                    # 当模型初始化如果启用了 use_adarms (通常为扩散时间步的特征融合)，此 LayerNorm 就具有了根据时间步来调节 Scaling 和 Shifting 的能力，类似典型的 FiLM 操作。
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
                     gates.append(gate)
 
@@ -173,11 +196,18 @@ class PaliGemmaWithExpertModel(nn.Module):
                     key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
                     value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+                    # 使用联合的 Query、Key、Value 对整个序列进行自注意力（Self-Attention）计算。
+                    # 这是专家模型获取视觉引导（Prefix）的核心交互层。
                     query_states.append(query_state)
                     key_states.append(key_state)
                     value_states.append(value_state)
 
                 # Concatenate and process attention
+                # 这里就是视觉语言前缀（Prefix）与动作序列后缀（Suffix）发生 Cross Attention / Self Attention 联合计算的地方，
+                # 但这种架构实际上是一种 **Full Attention (或者叫 Prefix-LM Attention)** 的扩展。
+                # 通过在序列长度（dim=2）这一维度拼接 Q, K, V，整个长序列的 Token 可以互相看到对方。
+                # 配合上游 pi0_pytorch.py 中传入的 `attention_mask`（控制可见性的因果矩阵：图像看图像，语言看图像+语言，动作看前面的全部），
+                # 他们在同一层的自注意力机制里完成了多模态 Modulation 和知识流通，而不是使用独立分离的 Cross-attention 层，这更符合大语言模型 (LLM) Decoder-only 或 Prefix-LM 的做法。
                 query_states = torch.cat(query_states, dim=2)
                 key_states = torch.cat(key_states, dim=2)
                 value_states = torch.cat(value_states, dim=2)

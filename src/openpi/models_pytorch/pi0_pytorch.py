@@ -76,7 +76,14 @@ def make_att_2d_masks(pad_masks, att_masks):
         raise ValueError(pad_masks.ndim)
 
     cumsum = torch.cumsum(att_masks, dim=1)
+    
+    # 这里的 <= 是张量广播（Broadcasting）的逐元素比较（Less than or Equal）。
+    # cumsum[:, None, :] 形状是 (B, 1, N)，cumsum[:, :, None] 形状是 (B, N, 1)，
+    # 两者比较后会自动广播成一个 (B, N, N) 的布尔矩阵。
+    # 对于每个 Batch：二维布尔矩阵 (i, j) 位置如果为 True，意味着 Query Token 'i' 
+    # 被允许看到 Key Token 'j'。即 j 所在的累计组别 <= i 所在的累计组别。
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     return att_2d_masks & pad_2d_masks
 
